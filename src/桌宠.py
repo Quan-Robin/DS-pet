@@ -16,16 +16,6 @@ import threading
 if sys.platform == "win32":
     import ctypes  # 仅 Windows 鼠标穿透需要
 
-def load_config():
-    try:
-        with open("config.json", "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        print("配置读取失败:", e)
-        return {
-            "city": "汕头"
-        }
-
 try:
     import pynvml
     pynvml.nvmlInit()
@@ -40,7 +30,7 @@ from PySide6.QtGui import (QPainter, QPixmap, QFont, QColor, QIcon, QFontMetrics
 from PySide6.QtWidgets import (QApplication, QWidget, QMenu, QSystemTrayIcon,
                                QMessageBox, QInputDialog, QLineEdit, QVBoxLayout,
                                QHBoxLayout, QPushButton, QFrame, QDialog, QToolButton)
-from dsh_monitor import DshMonitor, CHECK_EVERY
+from dsh_monitor import DshMonitor
 
 
 
@@ -53,14 +43,19 @@ DS_SYSTEM = "你是桌面宠物大肥鱼，贱兮兮但可爱，每句话不超�
 _x11_lib = None
 _x11_dpy = None
 
-# 训练服务名（Season 4 生产测量）——训练期间不运行桌宠，避免 GPU 负载
+# 训练服务名（Season 4 生产测量）——训练期间不运行桌宠，避免 GPU 负载。
+# 个人环境专用：config.json 的 block_service 为空（默认）时不检查。
 TRAINING_UNIT = "junqi-season4-production-measurement-v1.service"
 
 
 def training_running():
-    """训练服务是否在运行。"""
+    """训练服务是否在运行（仅 config 指定了 block_service 时检查）。"""
     try:
-        out = subprocess.run(["systemctl", "--user", "is-active", TRAINING_UNIT],
+        cfg = load_json(CONFIG_PATH, {})
+        unit = cfg.get("block_service") or ""
+        if not unit:
+            return False
+        out = subprocess.run(["systemctl", "--user", "is-active", unit],
                              capture_output=True, text=True, timeout=5)
         return out.stdout.strip() == "active"
     except Exception:
@@ -449,7 +444,7 @@ class PetWindow(QWidget):
         if ok and city.strip():
             self.cfg["city"] = city.strip()
             self.cfg["city_manual"] = True  # 手动设置后不再自动定位
-            print("cfg现在:", self.cfg["city"])
+            self._save_cfg()
             self.say(f"城市已设置为{city}")
 
     def __init__(self):
@@ -590,15 +585,10 @@ class PetWindow(QWidget):
         self.timer.timeout.connect(self.tick)
         self.timer.start(TICK)
 
-        # DSH 对话状态监控（只读轮询，见 dsh_monitor.py）
+        # DSH 对话状态监控（只读轮询，后台线程执行，见 dsh_monitor.py）
         self.dsh_state = "idle"
         self.dsh = DshMonitor(self._on_dsh_change, self._on_dsh_turn_end)
-        self.dsh_timer = QTimer(self)
-        self.dsh_timer.timeout.connect(self.dsh.poll)
-        self.dsh_timer.start(int(CHECK_EVERY * 1000))
-        self.dsh.poll()
-        # 首轮 poll 只建立基线不回调，需手动同步初始状态
-        self.dsh_state = self.dsh.state or "idle"
+        self.dsh.start()
 
         self.bubble_font = QFont("Microsoft YaHei UI", 11)
 
@@ -618,6 +608,22 @@ class PetWindow(QWidget):
         self.snap_into_screen()
         if self.cfg.get("passthrough", False):
             self._apply_passthrough(True)
+
+    # ---------- 配置保存 ----------
+    def _save_cfg(self):
+        """原子写配置（临时文件 + rename），避免写入中途被杀留下截断 JSON。"""
+        try:
+            os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+            tmp = CONFIG_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.cfg, f, ensure_ascii=False, indent=2)
+            if sys.platform != "win32":
+                # 配置里有 API Key：临时文件先收紧权限再替换，避免 replace 后
+                # 出现权限 644 的窗口期
+                os.chmod(tmp, 0o600)
+            os.replace(tmp, CONFIG_PATH)
+        except Exception as e:
+            print("配置保存失败:", e)
 
     # ---------- AI 方法 ----------
     def _call_ds(self, user_msg):
@@ -650,19 +656,19 @@ class PetWindow(QWidget):
                 "temperature": 0.9
             }
             try:
-                resp = requests.post(url, json=payload, headers=headers, timeout=10)
+                resp = requests.post(url, json=payload, headers=headers, timeout=30)
                 if resp.status_code == 200:
                     reply = resp.json()["choices"][0]["message"]["content"].strip()
                     if len(reply) > 30:
                         reply = reply[:28] + "…"
-                    # 存入历史
-                    self.chat_history.append({"role": "user", "content": user_msg})
-                    self.chat_history.append({"role": "assistant", "content": reply})
-                    if len(self.chat_history) > self.max_history:
-                        self.chat_history = self.chat_history[-self.max_history:]
+                    self._queue_history(user_msg, reply)
                     self._queue_say(reply)
                 else:
-                    error_msg = resp.json().get("error", {}).get("message", str(resp.status_code))
+                    try:
+                        error_msg = resp.json().get("error", {}).get("message", str(resp.status_code))
+                    except ValueError:
+                        # 非 JSON 响应（网关 HTML 错误页等）
+                        error_msg = f"HTTP {resp.status_code}"
                     self._queue_say(f"API错误: {error_msg[:12]}")
                     print(f"[DeepSeek] 状态码: {resp.status_code}, 返回: {resp.text}")
             except requests.exceptions.Timeout:
@@ -909,11 +915,19 @@ class PetWindow(QWidget):
     def tick(self):
         self.t += 1
 
-        # 处理后台线程（DeepSeek 等）排队的气泡消息，Qt 界面必须在主线程更新
+        # 处理后台线程（DeepSeek 等）排队的消息，Qt 界面必须在主线程更新。
+        # 队列元素：("say", text) 气泡 | ("history", user, reply) 写入对话历史
         if self._say_queue:
-            for text in self._say_queue:
-                self.say(text)
-            self._say_queue.clear()
+            # 原子换出队列再消费：避免消费后 clear() 清掉并发新入队消息
+            items, self._say_queue = self._say_queue, []
+            for item in items:
+                if item[0] == "say":
+                    self.say(item[1])
+                elif item[0] == "history":
+                    self.chat_history.append({"role": "user", "content": item[1]})
+                    self.chat_history.append({"role": "assistant", "content": item[2]})
+                    if len(self.chat_history) > self.max_history:
+                        self.chat_history = self.chat_history[-self.max_history:]
 
         self.check_system_status()
 
@@ -1047,7 +1061,8 @@ class PetWindow(QWidget):
             elif pick < 0.95:
                 if self.t - self.last_speak_tick >= 1500:
                     self.last_speak_tick = self.t
-                    if pick < 0.82:
+                    # pick<0.92 已被上面分支占用；此处 0.92-0.95 内再细分内心戏/普通
+                    if random.random() < 0.6:
                         self.say(random.choice(INNER_LINES), inner=True)
                     else:
                         self.say(random.choice(LINES))
@@ -1115,7 +1130,11 @@ class PetWindow(QWidget):
 
     def _queue_say(self, text):
         """后台线程调用：只入队，由主线程 tick 统一弹出显示（线程安全）"""
-        self._say_queue.append(text)
+        self._say_queue.append(("say", text))
+
+    def _queue_history(self, user_msg, reply):
+        """后台线程调用：对话历史只在主线程写入（线程安全）"""
+        self._say_queue.append(("history", user_msg, reply))
 
     def say(self, text, inner=False):
         if text == self.last_line and not text.startswith("天气"):
@@ -1127,21 +1146,22 @@ class PetWindow(QWidget):
         self.update()
 
     def _on_dsh_change(self, state):
+        # 后台线程回调：只更新状态 + 入队气泡，UI 更新由主线程 tick 处理
         self.dsh_state = state
         if not self.cfg.get("dsh_alerts", self.cfg.get("rx_alerts", True)):
             return
         if state == "working":
-            self.say("DSH 开始干活了！我盯着呢～")
+            self._queue_say("DSH 开始干活了！我盯着呢～")
 
     def _on_dsh_turn_end(self, summary):
-        """DSH 一轮对话完成（turn/end 事件）——完成提醒。"""
+        """DSH 一轮对话完成（turn/end 事件）——完成提醒（后台线程回调）。"""
         if not self.cfg.get("dsh_alerts", self.cfg.get("rx_alerts", True)):
             return
         brief = (summary or "").strip().replace("\n", " ")[:20]
         if brief:
-            self.say(f"DSH 忙完啦！它说：{brief}…")
+            self._queue_say(f"DSH 忙完啦！它说：{brief}…")
         else:
-            self.say("DSH 忙完啦！快去看看结果～")
+            self._queue_say("DSH 忙完啦！快去看看结果～")
 
     def check_system_status(self):
             now = self.t * TICK
@@ -1295,10 +1315,13 @@ class PetWindow(QWidget):
                 self.cfg["city"] = city
 
     def _get_weather(self):
+        """菜单动作：只启动后台线程，网络请求不阻塞 UI。"""
+        threading.Thread(target=self._fetch_weather_worker, daemon=True).start()
+
+    def _fetch_weather_worker(self):
         try:
             self._ensure_city()
             city = self.cfg.get("city", "汕头")
-            print("当前城市:", city)
 
             url = f"https://wttr.in/{city}?format=j1"
 
@@ -1310,9 +1333,6 @@ class PetWindow(QWidget):
                 }
             )
 
-            print("状态:", r.status_code)
-            print(r.text[:500])
-
             data = r.json()
 
             weather = data["current_condition"][0]
@@ -1320,24 +1340,31 @@ class PetWindow(QWidget):
             temp = weather["temp_C"]
 
             weather_map = {
-                "Sunny": "晴",
-                "Clear": "晴",
-                "Partly cloudy": "多云",
-                "Cloudy": "阴",
-                "Light rain": "小雨",
-                "Moderate rain": "中雨",
-                "Heavy rain": "大雨"
+                "Sunny": "晴", "Clear": "晴",
+                "Partly cloudy": "多云", "Partly cloudy ": "多云",
+                "Cloudy": "阴", "Overcast": "阴",
+                "Mist": "薄雾", "Fog": "雾", "Haze": "霾",
+                "Patchy rain possible": "可能有零星小雨",
+                "Patchy light rain": "零星小雨",
+                "Light rain": "小雨", "Light drizzle": "小毛雨",
+                "Moderate rain": "中雨", "Heavy rain": "大雨",
+                "Light rain shower": "阵雨（小）", "Rain shower": "阵雨",
+                "Torrential rain shower": "暴雨",
+                "Patchy light snow": "零星小雪", "Light snow": "小雪",
+                "Moderate snow": "中雪", "Heavy snow": "大雪",
+                "Thunder": "雷声", "Thundery outbreaks possible": "可能有雷阵雨",
+                "Thunderstorm": "雷暴", "Blowing snow": "吹雪",
             }
 
             raw_weather = weather["weatherDesc"][0]["value"]
 
             desc = weather_map.get(raw_weather, raw_weather)
 
-            self.say(f"{city}今天{temp}°，天气{desc}")
+            self._queue_say(f"{city}今天{temp}°，天气{desc}")
 
         except Exception as e:
             print("天气错误:", repr(e))
-            self.say("天气获取失败")
+            self._queue_say("天气获取失败")
     
 
     def _build_menu(self):
@@ -1362,7 +1389,7 @@ class PetWindow(QWidget):
         ra = dsh.addAction("完成提醒")
         ra.setCheckable(True)
         ra.setChecked(self.cfg.get("dsh_alerts", self.cfg.get("rx_alerts", True)))
-        ra.triggered.connect(lambda on: self.cfg.update(dsh_alerts=bool(on)))
+        ra.triggered.connect(lambda on: (self.cfg.update(dsh_alerts=bool(on)), self._save_cfg()))
         m.addSeparator()
         m.addAction("显示/隐藏", self.toggle_visible)
         m.addAction("回到屏幕内", self.snap_into_screen)
@@ -1392,6 +1419,7 @@ class PetWindow(QWidget):
         )
         if ok and key.strip():
             self.cfg["ds_api_key"] = key.strip()
+            self._save_cfg()
             self.say("Key 设置成功！")
         elif ok and not key.strip():
             self.say("Key 不能为空")
@@ -1412,10 +1440,12 @@ class PetWindow(QWidget):
         self.target = None
         self.peek = None  # 切换模式时退出探头状态
         self.cfg["mode"] = mode
+        self._save_cfg()
 
     def set_size(self, mult):
         self.cur_h = int(340 * mult)
         self.cfg["size"] = mult
+        self._save_cfg()
         self.cross_t = 0.0
         self.prev_key = None
         self.win_mx = int(self.cur_h * 0.062) + 6
@@ -1451,17 +1481,20 @@ class PetWindow(QWidget):
 
     def set_passthrough(self, on):
         self.cfg["passthrough"] = bool(on)
+        self._save_cfg()
         self._apply_passthrough(bool(on))
         if on:
             self.say("我隐身了！右键托盘图标解除～")
 
     def set_topmost(self, on):
         self.cfg["topmost"] = bool(on)
+        self._save_cfg()
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, bool(on))
         self.show()
 
     def set_autostart(self, on):
         self.cfg["autostart"] = bool(on)
+        self._save_cfg()
         if sys.platform == "win32":
             lnk = os.path.join(os.environ["APPDATA"], "Microsoft", "Windows",
                                "Start Menu", "Programs", "Startup", "大肥鱼桌宠.lnk")
@@ -1510,10 +1543,9 @@ class PetWindow(QWidget):
             self.raise_()
 
     def quit_app(self):
+        self.dsh.stop()
         self.cfg["x"], self.cfg["y"] = self.x(), self.y()
-        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(self.cfg, f, ensure_ascii=False, indent=2)
+        self._save_cfg()
         self.tray.hide()
         QApplication.quit()
 
