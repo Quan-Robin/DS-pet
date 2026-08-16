@@ -26,7 +26,7 @@ except:
 import requests
 from PySide6.QtCore import Qt, QTimer, QPoint, QPointF, QRectF, QRect, QEvent
 from PySide6.QtGui import (QPainter, QPixmap, QFont, QColor, QIcon, QFontMetrics,
-                           QPolygonF)
+                           QPolygonF, QActionGroup)
 from PySide6.QtWidgets import (QApplication, QWidget, QMenu, QSystemTrayIcon,
                                QMessageBox, QInputDialog, QLineEdit, QVBoxLayout,
                                QHBoxLayout, QPushButton, QFrame, QDialog, QToolButton)
@@ -1058,6 +1058,8 @@ class PetWindow(QWidget):
                     if need > self.width():
                         self.base_win_w = self.width()
                         self.setFixedSize(need, self.height())
+                        # 加宽后窗口可能超出屏幕（侧边时最明显），拉回屏内
+                        self.snap_into_screen()
             elif pick < 0.95:
                 if self.t - self.last_speak_tick >= 1500:
                     self.last_speak_tick = self.t
@@ -1097,6 +1099,8 @@ class PetWindow(QWidget):
             if need > self.width():
                 self.base_win_w = self.width()
                 self.setFixedSize(need, self.height())
+                # 加宽后窗口可能超出屏幕，拉回屏内
+                self.snap_into_screen()
 
     def _do_peek(self):
         """探头动画：探入（0.8s）→ 停留展示（5s）→ 缩回（0.8s），只探一次。"""
@@ -1370,16 +1374,20 @@ class PetWindow(QWidget):
     def _build_menu(self):
         m = QMenu(self)
         mode_menu = m.addMenu("模式")
+        mode_group = QActionGroup(self)
         for label, key in [("自由散步", "wander"), ("跟随鼠标", "follow"), ("原地待着", "still")]:
             a = mode_menu.addAction(label)
             a.setCheckable(True)
             a.setChecked(self.mode == key)
+            mode_group.addAction(a)
             a.triggered.connect(lambda _, k=key: self.set_mode(k))
         size_menu = m.addMenu("大小")
+        size_group = QActionGroup(self)
         for label, mult in SIZE_LEVELS.items():
             a = size_menu.addAction(label)
             a.setCheckable(True)
             a.setChecked(abs(self.cur_h - 340 * mult) < 2)
+            size_group.addAction(a)
             a.triggered.connect(lambda _, v=mult: self.set_size(v))
         m.addAction("设置 Key", self._set_key_dialog)
         m.addAction("查看天气", self._get_weather)

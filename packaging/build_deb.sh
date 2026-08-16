@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$ROOT/src"
 PKG_NAME="dafeiyu-pet"
-VERSION="1.0.0"
+VERSION="1.0.1"
 ARCH="amd64"
 DEB="$ROOT/${PKG_NAME}_${VERSION}_${ARCH}.deb"
 
