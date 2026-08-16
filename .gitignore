@@ -1,0 +1,16 @@
+# 构建产物
+src/build/
+src/dist/
+src/*.spec
+dist/
+*.deb
+
+# Python
+__pycache__/
+*.pyc
+
+# 个人/本地文件
+会话摘要.md
+素材导出/
+peek_probe.py
+peek_verify.py

@@ -1,0 +1,16 @@
+Package: dafeiyu-pet
+Version: 1.0.0
+Section: games
+Priority: optional
+Architecture: amd64
+Depends: libgl1, libegl1, libxkbcommon0, libxcb-cursor0, libxcb-icccm4, libxcb-keysyms1, libxcb-shape0, libxcb-xinerama0, libxcb-xkb1, libxcb-render-util0, libxcb-image0, libxcb-randr0, libdbus-1-3, libfontconfig1, libfreetype6
+Maintainer: dafeiyu-pet Linux 打包 <noreply@example.com>
+Description: 大肥鱼桌宠 — DeepSeek 二创形象「鲸鱼娘·大肥鱼」透明桌面宠物
+ 基于三视图素材（正面/侧面/背面），用 Python + PySide6 实现的
+ 无边框透明置顶桌面宠物。
+ .
+ 功能：三视图行走、自由散步/跟随鼠标/原地待着三种模式、
+ 拖拽/蹦跳/喂食互动、随机台词、托盘菜单、鼠标穿透、开机自启、
+ AI 对话（DeepSeek API）、天气查询（wttr.in）、系统状态监控。
+ .
+ 本包为 PyInstaller 自包含构建，无需安装 Python 或额外依赖。

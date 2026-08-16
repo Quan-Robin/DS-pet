@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=大肥鱼桌宠
+Name[en]=Dafeiyu Pet
+Comment=透明桌面宠物（鲸鱼娘·大肥鱼）
+Exec=/opt/dafeiyu-pet/dafeiyu-pet
+Icon=dafeiyu-pet
+Terminal=false
+Categories=Utility;Game;
+StartupNotify=false
