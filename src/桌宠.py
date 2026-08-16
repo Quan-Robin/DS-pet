@@ -957,6 +957,13 @@ class PetWindow(QWidget):
         if self.dragging:
             self.update()
             return
+
+        if self.action is not None:
+            # 动作（趴下/耳朵晃动等）播放期间不移动：休息剩余时间可能短于
+            # 动作时长（lie_hold 可调大），rest 到期后 target 生成会导致
+            # "趴着/晃着移动"。动作期间保持原地，动作结束再移动。
+            self.update()
+            return
         now_ms = self.t * TICK
 
         if self.mode == "follow":
@@ -1401,6 +1408,7 @@ class PetWindow(QWidget):
         m.addSeparator()
         m.addAction("显示/隐藏", self.toggle_visible)
         m.addAction("回到屏幕内", self.snap_into_screen)
+        m.addAction("调试参数", self._open_tuner)
         pa = m.addAction("鼠标穿透（点不到它）")
         pa.setCheckable(True)
         pa.setChecked(self.cfg["passthrough"])
@@ -1437,6 +1445,19 @@ class PetWindow(QWidget):
             self.tray.setContextMenu(self._build_menu())
         elif reason == QSystemTrayIcon.ActivationReason.Trigger:
             self.toggle_visible()
+
+    def _open_tuner(self):
+        """打开参数调试窗口（debug_tuner.py，仅源码版存在）。"""
+        tuner = os.path.join(APP_DIR, "debug_tuner.py")
+        if not os.path.exists(tuner):
+            self.say("调试窗口仅源码版可用")
+            return
+        try:
+            subprocess.Popen([sys.executable, tuner],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        except Exception:
+            self.say("调试窗口打开失败")
 
     def contextMenuEvent(self, e):
         self.last_interact = self.t * TICK / 1000.0
