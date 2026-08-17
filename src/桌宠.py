@@ -29,7 +29,7 @@ from PySide6.QtGui import (QPainter, QPixmap, QFont, QColor, QIcon, QFontMetrics
                            QPolygonF, QActionGroup)
 from PySide6.QtWidgets import (QApplication, QWidget, QMenu, QSystemTrayIcon,
                                QMessageBox, QInputDialog, QLineEdit, QVBoxLayout,
-                               QHBoxLayout, QPushButton, QFrame, QDialog, QToolButton)
+                               QHBoxLayout, QPushButton, QFrame, QDialog, QToolButton, QLabel)
 from dsh_monitor import DshMonitor
 
 
@@ -590,6 +590,16 @@ class PetWindow(QWidget):
         self.dsh = DshMonitor(self._on_dsh_change, self._on_dsh_turn_end)
         self.dsh.start()
 
+        # DSH 审批提醒（轮询桌面端伴生插件的 /api/state，pendingApproval
+        # 出现时鱼提醒 + 弹窗，可直接批准/拒绝/看详情）。需 DSH-desktop
+        # 已安装伴生插件；未安装时轮询静默失败，不影响其它功能。
+        self._approval_dlg = None
+        self._approval_seen_id = None
+        self._approval_running = False
+        self._approval_thread_stop = threading.Event()
+        if self.cfg.get("dsh_approvals", True):
+            self._start_approval_polling()
+
         self.bubble_font = QFont("Microsoft YaHei UI", 11)
 
         # 托盘
@@ -917,6 +927,7 @@ class PetWindow(QWidget):
 
         # 处理后台线程（DeepSeek 等）排队的消息，Qt 界面必须在主线程更新。
         # 队列元素：("say", text) 气泡 | ("history", user, reply) 写入对话历史
+        #          | ("approval", ap) DSH 审批请求弹窗 | ("approval-clear",) 审批已处理
         if self._say_queue:
             # 原子换出队列再消费：避免消费后 clear() 清掉并发新入队消息
             items, self._say_queue = self._say_queue, []
@@ -928,6 +939,10 @@ class PetWindow(QWidget):
                     self.chat_history.append({"role": "assistant", "content": item[2]})
                     if len(self.chat_history) > self.max_history:
                         self.chat_history = self.chat_history[-self.max_history:]
+                elif item[0] == "approval":
+                    self._show_approval(item[1])
+                elif item[0] == "approval-clear":
+                    self._close_approval()
 
         self.check_system_status()
 
@@ -1174,6 +1189,132 @@ class PetWindow(QWidget):
         else:
             self._queue_say("DSH 忙完啦！快去看看结果～")
 
+    # ---------- DSH 审批提醒（联动 DSH-desktop 伴生插件） ----------
+
+    def _approval_port(self):
+        try:
+            return int(self.cfg.get("dsh_port", 3080))
+        except (TypeError, ValueError):
+            return 3080
+
+    def _start_approval_polling(self):
+        if getattr(self, "_approval_running", False):
+            return
+        self._approval_running = True
+        self._approval_thread_stop.clear()
+        threading.Thread(target=self._poll_approvals, daemon=True,
+                         name="dsh-approvals").start()
+
+    def _stop_approval_polling(self):
+        self._approval_thread_stop.set()
+
+    def _poll_approvals(self):
+        """后台线程：轮询伴生插件 /api/state 的 pendingApproval。"""
+        while not self._approval_thread_stop.wait(2.0):
+            if not self.cfg.get("dsh_approvals", True):
+                continue
+            try:
+                r = requests.get(
+                    f"http://127.0.0.1:{self._approval_port()}/api/state",
+                    timeout=2)
+                if r.status_code != 200:
+                    continue
+                ap = (r.json() or {}).get("pendingApproval")
+                if ap and ap.get("id") and ap.get("id") != self._approval_seen_id:
+                    self._approval_seen_id = ap.get("id")
+                    self._say_queue.append(("approval", ap))
+                elif not ap and self._approval_seen_id:
+                    self._approval_seen_id = None
+                    self._say_queue.append(("approval-clear",))
+            except Exception:
+                pass  # 插件未装 / DSH 未跑：静默
+
+    def _send_approval(self, decision):
+        """后台线程：POST 批准/拒绝到伴生插件。"""
+        port = self._approval_port()
+        def worker():
+            try:
+                r = requests.post(
+                    f"http://127.0.0.1:{port}/api/approve",
+                    json={"decision": decision}, timeout=4)
+                if r.status_code == 200:
+                    self._queue_say("已批准～" if decision == "approve" else "已拒绝！")
+                elif r.status_code == 501:
+                    self._queue_say("这个 DSH 版本不支持远程审批，去窗口里点吧")
+                else:
+                    self._queue_say(f"审批没发出去（HTTP {r.status_code}）")
+            except Exception:
+                self._queue_say("审批没发出去，检查 DSH 是否在跑")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_approval(self, ap):
+        """主线程：鱼提醒 + 审批小弹窗（批准 / 拒绝 / 看详情）。"""
+        summary = (ap.get("summary") or "").strip()[:120]
+        self.say("DSH 在等审批！要帮它点吗？")
+        dlg = QDialog(self)
+        dlg.setWindowTitle("DSH 审批")
+        dlg.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
+                           | Qt.WindowType.WindowStaysOnTopHint)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(14, 12, 14, 12)
+        tip = QLabel("⚠️ DSH 等待审批（仅摘要，高危操作建议看详情）")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+        body = QLabel(summary or "（无摘要）")
+        body.setWordWrap(True)
+        body.setStyleSheet("color:#666;")
+        lay.addWidget(body)
+        row = QHBoxLayout()
+        btn_view = QPushButton("看详情")
+        btn_reject = QPushButton("拒绝")
+        btn_approve = QPushButton("批准")
+        btn_approve.setStyleSheet("background:#2e7d32;color:white;border:none;border-radius:6px;padding:5px 14px;")
+        btn_reject.setStyleSheet("background:transparent;color:#c62828;border:1px solid #c62828;border-radius:6px;padding:4px 12px;")
+        for b in (btn_view, btn_reject, btn_approve):
+            row.addWidget(b)
+        lay.addLayout(row)
+
+        def on_view():
+            import webbrowser
+            webbrowser.open(f"http://127.0.0.1:{self._approval_port()}/")
+            dlg.close()
+        def on_approve():
+            self._send_approval("approve")
+            dlg.close()
+        def on_reject():
+            self._send_approval("reject")
+            dlg.close()
+        btn_view.clicked.connect(on_view)
+        btn_approve.clicked.connect(on_approve)
+        btn_reject.clicked.connect(on_reject)
+
+        dlg.finished.connect(lambda *_: setattr(self, "_approval_dlg", None))
+        # 弹在鱼旁边
+        dlg.adjustSize()
+        dlg.move(self.x() + self.width() // 2 - dlg.width() // 2,
+                 self.y() - dlg.height() - 12)
+        dlg.show()
+        dlg.raise_()
+        self._approval_dlg = dlg
+
+    def _close_approval(self):
+        """主线程：审批已被处理（网页/桌面端/宠物任一处），收掉弹窗。"""
+        if self._approval_dlg is not None:
+            try:
+                self._approval_dlg.close()
+            except Exception:
+                pass
+            self._approval_dlg = None
+
+    def _toggle_approvals(self, on):
+        """菜单开关：开启时确保轮询线程在跑，关闭时收弹窗（线程空转）。"""
+        self.cfg.update(dsh_approvals=bool(on))
+        self._save_cfg()
+        if on:
+            self._start_approval_polling()
+        else:
+            self._close_approval()
+
     def check_system_status(self):
             now = self.t * TICK
 
@@ -1405,6 +1546,10 @@ class PetWindow(QWidget):
         ra.setCheckable(True)
         ra.setChecked(self.cfg.get("dsh_alerts", self.cfg.get("rx_alerts", True)))
         ra.triggered.connect(lambda on: (self.cfg.update(dsh_alerts=bool(on)), self._save_cfg()))
+        aa = dsh.addAction("审批提醒（可直接批准/拒绝）")
+        aa.setCheckable(True)
+        aa.setChecked(self.cfg.get("dsh_approvals", True))
+        aa.triggered.connect(self._toggle_approvals)
         m.addSeparator()
         m.addAction("显示/隐藏", self.toggle_visible)
         m.addAction("回到屏幕内", self.snap_into_screen)
@@ -1573,6 +1718,7 @@ class PetWindow(QWidget):
 
     def quit_app(self):
         self.dsh.stop()
+        self._stop_approval_polling()
         self.cfg["x"], self.cfg["y"] = self.x(), self.y()
         self._save_cfg()
         self.tray.hide()
