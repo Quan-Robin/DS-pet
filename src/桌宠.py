@@ -109,6 +109,35 @@ else:
 BUBBLE_H = 56
 MARGIN = 4
 SIZE_LEVELS = {"小": 0.55, "中": 0.7, "大": 0.9}
+
+# 耳朵晃动播放参数：30 帧素材按 30fps 乒乓往返（单程 1s，一轮约 2s）
+EAR_MAX_FRAMES = 30   # 素材帧数上限（实际张数自动探测，兼容旧的 5 帧素材）
+EAR_FPS = 30
+EAR_HOLD_STEPS = 0    # 两端各停留的步数（0=不停留；缓动已烘焙进素材，不在此处做）
+
+
+def ear_cursor(step, n, hold=EAR_HOLD_STEPS):
+    """耳朵晃动播放游标：第 step 个 tick 对应的帧下标（step 为整数，逐 tick 自增）。
+
+    乒乓序列 0,1,..,n-1,n-2,..,1 循环，下标恒在 0..n-1 内（历史上越界出过残影）。
+    用整数步而非累计浮点秒数：int(t*fps) 在浮点累加下会在过环处重复一帧、跳过一帧。
+    """
+    period = 2 * n - 2 + 2 * hold
+    i = step % period
+    if i < hold:
+        return 0
+    i -= hold
+    if i < n:
+        return i
+    return 2 * n - 2 - i      # 回程：n-1 → 1（与单程首帧衔接成闭环，不重复 0）
+
+
+def ear_playback(base_frames):
+    """返回 (帧序列, 乒乓重排下标序列)；None 基帧沿用第一帧，便于缺帧时降级。"""
+    frames = [f if f is not None else base_frames[0] for f in base_frames]
+    n = len(frames)
+    return frames, [ear_cursor(i, n) for i in range(2 * n - 2 + 2 * EAR_HOLD_STEPS)]
+
 TICK = 20
 # 探头/移动可调参数：默认值在 _load_tunables()，可用 config.json 覆盖。
 # 调试窗口 debug_tuner.py 实时调节，桌宠 1.5s 内热重载生效。
@@ -482,6 +511,7 @@ class PetWindow(QWidget):
         # 精灵加载
         self.sprites = {}
         self.ear_frames = {}  # 耳朵晃动帧序列：h -> [QPixmap]
+        self.ear_frames_pp = {}  # 乒乓重排后的播放序列：h -> [QPixmap]
         self.walk_frames = {}  # 走路动画帧序列（预留）：h -> [QPixmap]
         for label, mult in SIZE_LEVELS.items():
             h = int(340 * mult)
@@ -495,16 +525,20 @@ class PetWindow(QWidget):
                 self.sprites[(name, h)] = pix
             # 耳朵晃动帧序列（空闲随机动画）
             frames = []
-            for i in range(1, 6):
+            for i in range(1, EAR_MAX_FRAMES + 1):
                 fp = os.path.join(SPRITE_DIR, f"耳朵晃动_{i}_{h}.png")
                 if not os.path.exists(fp):
                     fp = os.path.join(SPRITE_DIR, f"耳朵晃动_{i}_306.png")
                 if os.path.exists(fp):
                     frames.append(QPixmap(fp).scaledToHeight(
                         h, Qt.TransformationMode.SmoothTransformation))
+                elif frames:
+                    break   # 序号连续，断了就停，避免中间缺帧时白找
             if frames:
                 self.sprites[("耳朵晃动", h)] = frames[0]
                 self.ear_frames.setdefault(h, frames)
+                _, order = ear_playback(frames)
+                self.ear_frames_pp[h] = [frames[k] for k in order]
             # 走路动画帧预留：命名 走路_1_306.png ~ 走路_N_306.png（透明背景）。
             # 用户后续提供走路照片后，在 _sprite_key 的 walking 分支返回
             # ("走路", cur_h, facing, False, 0)，并在 draw_one 加帧序列逻辑
@@ -540,6 +574,7 @@ class PetWindow(QWidget):
         self.action = None
         self.action_t = 0.0
         self.action_t0 = 0.0  # 动作初始时长（帧动画按总时长映射进度）
+        self.ear_step = 0     # 耳朵晃动播放步（整数，逐 tick 自增；避免浮点累加丢帧）
         self.bubble_text = ""
         self.bubble_until = 0
         self.bubble_inner = False
@@ -771,13 +806,9 @@ class PetWindow(QWidget):
             if key is None:
                 return
             name, h, facing, vflip, rot = key
-            if name == "耳朵晃动" and h in self.ear_frames:
-                frames = self.ear_frames[h]
-                # 帧索引按动作总时长映射进度（钳制 0..1，避免 action_t>1 时负数越界）
-                total = self.action_t0 if self.action_t0 > 0 else 1.0
-                prog = min(max(1.0 - self.action_t / total, 0.0), 1.0)
-                idx = min(int(prog * len(frames)), len(frames) - 1)
-                pix = frames[idx]
+            if name == "耳朵晃动" and h in self.ear_frames_pp:
+                seq = self.ear_frames_pp[h]
+                pix = seq[ear_cursor(self.ear_step, len(seq))]
             else:
                 pix = self.sprites[(name, h)]
             ph = pix.height() * scale * (1 + act_sy)
@@ -958,9 +989,11 @@ class PetWindow(QWidget):
         if self.cross_t > 0:
             self.cross_t = max(0.0, self.cross_t - 0.15)
         if self.action_t > 0:
+            self.ear_step += 1               # 与 tick 同步推进（TICK=20ms → 50Hz 采 30fps 素材）
             self.action_t = max(0.0, self.action_t - 0.03)
             if self.action_t == 0:
                 self.action = None
+                self.ear_step = 0
                 if self.base_win_w:  # 动作图加宽的窗口恢复默认宽度
                     self.setFixedSize(self.base_win_w, self.height())
                     self.base_win_w = 0
@@ -1072,6 +1105,7 @@ class PetWindow(QWidget):
             elif pick < 0.85:
                 if self.cur_h in self.ear_frames:
                     self.action, self.action_t, self.action_t0 = "ear", 3.0, 3.0
+                    self.ear_step = 0
             elif pick < 0.92:
                 if ("趴下", self.cur_h) in self.sprites:
                     self.action, self.action_t, self.action_t0 = "lie", self.lie_hold, self.lie_hold
