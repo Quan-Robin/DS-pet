@@ -24,7 +24,7 @@
 
 ### 动作系统（新增）
 - **趴下**：趴下休息（图片精灵 + 窗口自动加宽适配），时长/大小可调
-- **耳朵晃动**：5 帧帧动画（慢速）
+- **耳朵晃动**：30 帧 / 乒乓循环 @30fps（单程 1s，一轮约 2s），由 12 张 AI 关键帧（仅耳鳍角度不同）经 `packaging/make_ear_frames.py` 补帧生成；摆角由 `packaging/measure_b1.py` 实测（枢轴=鳍根，跨度 68°），起停半余弦缓动
 - **走路动画预留**：提供 `走路_N_306.png` 帧序列加载接口，后续补充素材即可启用
 
 ### DSH 对话状态提醒（适配 DSH-desktop-for-Linux）
@@ -86,4 +86,5 @@ cd .. && packaging/build_deb.sh
 
 - 基础精灵图与原始语录来自原项目 [dafeiyu-pet](https://github.com/1190fasheqi/dafeiyu-pet)（原作者：1190fasheqi）
 - 探头 / 趴下 / 耳朵晃动素材为 AI 生成（`src/sprites/` 为处理后的运行时素材）
+- 耳朵晃动补帧与质检：`packaging/make_ear_frames.py`（生成 30 帧）、`packaging/measure_b1.py`（关键帧实测）、`packaging/verify_ear_frames.py`（六项质检）、`packaging/test_ear_anim.py`（播放游标逻辑测试）、`packaging/derive_tiers.py`（306→238/187 档位派生，构建 deb 时自动执行）
 - 本项目完全由 DeepSeek 系列模型创建并维护。

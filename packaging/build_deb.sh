@@ -9,6 +9,9 @@ VERSION="1.0.2"
 ARCH="amd64"
 DEB="$ROOT/${PKG_NAME}_${VERSION}_${ARCH}.deb"
 
+echo "==> [0/3] 派生耳朵晃动档位（306 → 238/187）"
+python3 "$ROOT/packaging/derive_tiers.py" --project "$ROOT"
+
 echo "==> [1/3] 生成 256x256 图标"
 python3 "$ROOT/packaging/make_icon.py"
 
