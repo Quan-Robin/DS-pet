@@ -1307,6 +1307,7 @@ class PetWindow(QWidget):
             try:
                 r = requests.get(
                     f"http://127.0.0.1:{self._approval_port()}/api/state",
+                    params={"client": "pet"},   # 让插件知道 pet 在线 → 桌面版不再另弹审批窗
                     timeout=2)
                 if r.status_code != 200:
                     self._dsh_port_ok = None   # 端口可能变了 → 下轮重新探测
@@ -1329,6 +1330,7 @@ class PetWindow(QWidget):
             try:
                 r = requests.post(
                     f"http://127.0.0.1:{port}/api/approve",
+                    params={"client": "pet"},
                     json={"decision": decision}, timeout=4)
                 if r.status_code == 200:
                     self._queue_say("已批准～" if decision == "approve" else "已拒绝！")
@@ -1368,8 +1370,11 @@ class PetWindow(QWidget):
         self._set_topmost(False)
         dlg = QDialog(self)
         dlg.setWindowTitle("DSH 审批")
-        # 不置顶：DSH 审批窗口需要能盖在它上面并被点击
-        dlg.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool)
+        # 弹窗本身**保持置顶**：它是用户要点按钮的地方，不能被其他窗口盖住。
+        # （1.0.5 曾把它也取消置顶，结果反被别的窗口挡住 —— 置顶只应从"桌宠主窗"
+        #   上摘掉，避免主窗压住 DSH 的审批窗口，而不是摘掉弹窗自己的置顶。）
+        dlg.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
+                           | Qt.WindowType.WindowStaysOnTopHint)
         lay = QVBoxLayout(dlg)
         lay.setContentsMargins(14, 12, 14, 12)
         tip = QLabel("⚠️ DSH 等待审批（仅摘要，高危操作建议看详情）")
