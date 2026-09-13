@@ -1366,9 +1366,16 @@ class PetWindow(QWidget):
         """主线程：鱼提醒 + 审批小弹窗（批准 / 拒绝 / 看详情）。"""
         summary = (ap.get("summary") or "").strip()[:120]
         self.say("DSH 在等审批！要帮它点吗？")
-        # 让出置顶：DSH 的审批窗口需要可点（原先桌宠会挡住它的按钮）
+        # 让开位置：Qt.Tool 窗口即使去掉置顶标志，多数窗管下仍浮在普通窗口之上，
+        # 因此仅"取消置顶"不足以让审批窗可点 —— 直接把桌宠本体隐藏，
+        # 审批弹窗改成无父窗口的独立窗（不会被连带隐藏）。
         self._set_topmost(False)
-        dlg = QDialog(self)
+        try:
+            self._pet_was_visible = self.isVisible()
+            self.hide()
+        except Exception:
+            self._pet_was_visible = False
+        dlg = QDialog(None)          # 无父窗口：桌宠隐藏后它仍独立显示
         dlg.setWindowTitle("DSH 审批")
         # 弹窗本身**保持置顶**：它是用户要点按钮的地方，不能被其他窗口盖住。
         # （1.0.5 曾把它也取消置顶，结果反被别的窗口挡住 —— 置顶只应从"桌宠主窗"
@@ -1409,10 +1416,14 @@ class PetWindow(QWidget):
         btn_reject.clicked.connect(on_reject)
 
         dlg.finished.connect(lambda *_: setattr(self, "_approval_dlg", None))
-        # 弹在鱼旁边
+        # 位置：贴在屏幕右下角（桌宠隐藏后没有"鱼旁边"可依），
+        # 避开桌面版审批窗所在的屏幕上方居中区域。
         dlg.adjustSize()
-        dlg.move(self.x() + self.width() // 2 - dlg.width() // 2,
-                 self.y() - dlg.height() - 12)
+        try:
+            scr = QApplication.primaryScreen().availableGeometry()
+            dlg.move(scr.right() - dlg.width() - 24, scr.bottom() - dlg.height() - 24)
+        except Exception:
+            dlg.move(100, 100)
         dlg.show()
         dlg.raise_()
         self._approval_dlg = dlg
@@ -1420,6 +1431,13 @@ class PetWindow(QWidget):
     def _close_approval(self):
         """主线程：审批已被处理（网页/桌面端/宠物任一处），收掉弹窗。"""
         self._set_topmost(True)   # 审批结束，恢复置顶
+        if getattr(self, "_pet_was_visible", False):
+            try:
+                self.show()
+                self.raise_()
+            except Exception:
+                pass
+            self._pet_was_visible = False
         if self._approval_dlg is not None:
             try:
                 self._approval_dlg.close()
