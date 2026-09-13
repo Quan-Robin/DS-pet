@@ -4,9 +4,10 @@
 被验行为（从 src/桌宠.py 提取的实现）：
   1 乒乓游标：序列 0,1,..,n-1,n-2,..,1 与真实素材帧序**逐项相等**，含 58 步闭环；
   2 不越界、不重复、不跳号（历史 IndexError/残影回归点）；
-  3 帧数自适应：n=5（旧素材）与 n=30（新素材）都成立；
+  3 帧数自适应：n=5（旧素材）与 n=16（A/B 两套新素材）都成立；
   4 抖动容错：播放步是整数自增，tick 抖动不会丢帧（浮点方案在此处会重复+跳过）；
-  5 一轮 ≈ 2 秒 @30fps。
+  5 一轮 = (2n-2)×EAR_SLOW 个 tick（n=16、EAR_SLOW=2 → 60 tick = 1.2s 单程序列，
+    运行时再乒乓一次 → 显示一轮 2.36s，即 0.5 倍速）。
 
 用法：python3 test_ear_anim.py [--project <repo>]
 """
@@ -21,7 +22,7 @@ def load_logic(repo):
     src = open(os.path.join(repo, "src", "桌宠.py"), encoding="utf-8").read()
     tree = ast.parse(src)
     want_fn = {"ear_cursor", "ear_playback"}
-    want_c = {"EAR_MAX_FRAMES", "EAR_FPS", "EAR_HOLD_STEPS"}
+    want_c = {"EAR_MAX_FRAMES", "EAR_FPS", "EAR_HOLD_STEPS", "EAR_SLOW"}
     picked = []
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name in want_fn:
@@ -76,13 +77,18 @@ def main():
     else:
         print(f"PASS 重排: ear_playback 输出 {len(order)} 步乒乓序列（{n} 帧素材）")
 
-    # 5：一轮时长
-    n = 30
-    period = 2 * n - 2 + 2 * ns["EAR_HOLD_STEPS"]
-    cycle = period / float(fps)
-    print(f"  一轮 = {period} 步 @{fps}fps = {cycle:.2f}s（单程 {n / float(fps):.2f}s）")
-    if not (1.8 <= cycle <= 2.1):
-        fails.append(f"一轮 {cycle:.2f}s 超出预期 2s±0.1")
+    # 5：一轮时长（新素材：16 帧 A/B 两套，0.5 倍速）
+    # 运行时序列 = 乒乓序列每帧重复 EAR_SLOW 次，再由 ear_cursor 乒乓一次，
+    # 所以显示一轮 = (2L-2) 个 tick，L = (2n-2)×EAR_SLOW。
+    n = ns["EAR_MAX_FRAMES"]
+    slow = ns.get("EAR_SLOW", 1)
+    L = (2 * n - 2 + 2 * ns["EAR_HOLD_STEPS"]) * slow
+    period = 2 * L - 2                      # 显示周期（tick 数）
+    cycle = period * 0.02                   # TICK = 20ms
+    print(f"  一轮 = {period} tick × 20ms = {cycle:.2f}s"
+          f"（素材 {n} 帧 ×{slow} 降速 → 序列 {L} 帧）")
+    if not (2.0 <= cycle <= 2.8):
+        fails.append(f"一轮 {cycle:.2f}s 超出预期 2.0~2.8s（16 帧 0.5 倍速应约 2.36s）")
 
     if fails:
         print("\n=== FAIL ===")

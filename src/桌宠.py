@@ -110,9 +110,10 @@ BUBBLE_H = 56
 MARGIN = 4
 SIZE_LEVELS = {"小": 0.55, "中": 0.7, "大": 0.9}
 
-# 耳朵晃动播放参数：30 帧素材按 30fps 乒乓往返（单程 1s，一轮约 2s）
-EAR_MAX_FRAMES = 30   # 素材帧数上限（实际张数自动探测，兼容旧的 5 帧素材）
-EAR_FPS = 30
+# 耳朵晃动播放参数：素材按 0.5 倍速乒乓往返（每帧持续 2 个 tick = 40ms）
+EAR_MAX_FRAMES = 16   # 单套素材帧数（自动探测，兼容旧的 5/30 帧素材）
+EAR_FPS = 25          # 名义帧率（50Hz tick ÷ 2）
+EAR_SLOW = 2          # 每帧占用的 tick 数：2 → 0.5 倍速
 EAR_HOLD_STEPS = 0    # 两端各停留的步数（0=不停留；缓动已烘焙进素材，不在此处做）
 
 
@@ -138,6 +139,7 @@ def ear_playback(base_frames):
     n = len(frames)
     return frames, [ear_cursor(i, n) for i in range(2 * n - 2 + 2 * EAR_HOLD_STEPS)]
 
+CROSSFADE_ENABLED = False   # 见 draw 处注释：淡化会造成"重耳"
 TICK = 20
 # 探头/移动可调参数：默认值在 _load_tunables()，可用 config.json 覆盖。
 # 调试窗口 debug_tuner.py 实时调节，桌宠 1.5s 内热重载生效。
@@ -511,7 +513,9 @@ class PetWindow(QWidget):
         # 精灵加载
         self.sprites = {}
         self.ear_frames = {}  # 耳朵晃动帧序列：h -> [QPixmap]
-        self.ear_frames_pp = {}  # 乒乓重排后的播放序列：h -> [QPixmap]
+        self.ear_frames_pp = {}  # 乒乓重排后的播放序列：h -> [QPixmap]（= variants 的首套）
+        self.ear_variants = {}   # 随机变体：h -> [[QPixmap], ...]（A/B 两套）
+        self.ear_variant = {}    # 本次选中：h -> 变体下标
         self.walk_frames = {}  # 走路动画帧序列（预留）：h -> [QPixmap]
         for label, mult in SIZE_LEVELS.items():
             h = int(340 * mult)
@@ -523,22 +527,36 @@ class PetWindow(QWidget):
                     pix = QPixmap(os.path.join(SPRITE_DIR, f"{name}.png")).scaledToHeight(
                         h, Qt.TransformationMode.SmoothTransformation)
                 self.sprites[(name, h)] = pix
-            # 耳朵晃动帧序列（空闲随机动画）
-            frames = []
-            for i in range(1, EAR_MAX_FRAMES + 1):
-                fp = os.path.join(SPRITE_DIR, f"耳朵晃动_{i}_{h}.png")
-                if not os.path.exists(fp):
-                    fp = os.path.join(SPRITE_DIR, f"耳朵晃动_{i}_306.png")
-                if os.path.exists(fp):
-                    frames.append(QPixmap(fp).scaledToHeight(
-                        h, Qt.TransformationMode.SmoothTransformation))
-                elif frames:
-                    break   # 序号连续，断了就停，避免中间缺帧时白找
-            if frames:
-                self.sprites[("耳朵晃动", h)] = frames[0]
-                self.ear_frames.setdefault(h, frames)
-                _, order = ear_playback(frames)
-                self.ear_frames_pp[h] = [frames[k] for k in order]
+            # 耳朵晃动帧序列（空闲随机动画）：支持 A/B 两套变体，随机挑一套播放。
+            # 命名 耳朵晃动A_1_{h}.png ~ _N_ 与 耳朵晃动B_1_{h}.png ~ _N_；
+            # 两套画布已按躯干中心对齐，切换时角色不跳动。
+            def _load_seq(prefix):
+                seq = []
+                for i in range(1, EAR_MAX_FRAMES + 1):
+                    fp = os.path.join(SPRITE_DIR, f"{prefix}_{i}_{h}.png")
+                    if not os.path.exists(fp):
+                        fp = os.path.join(SPRITE_DIR, f"{prefix}_{i}_306.png")
+                    if os.path.exists(fp):
+                        seq.append(QPixmap(fp).scaledToHeight(
+                            h, Qt.TransformationMode.SmoothTransformation))
+                    elif seq:
+                        break   # 序号连续，断了就停，避免中间缺帧时白找
+                return seq
+            variants = [q for q in (_load_seq("耳朵晃动A"), _load_seq("耳朵晃动B")) if q]
+            if not variants:
+                variants = [q for q in (_load_seq("耳朵晃动"),) if q]
+            if variants:
+                self.sprites[("耳朵晃动", h)] = variants[0][0]
+                self.ear_frames.setdefault(h, variants[0])
+                pp_list = []
+                for seq in variants:
+                    _, order = ear_playback(seq)
+                    played = [seq[k] for k in order]
+                    if EAR_SLOW > 1:   # 每帧重复 EAR_SLOW 次 → 降速（0.5 倍速）
+                        played = [pix for pix in played for _ in range(EAR_SLOW)]
+                    pp_list.append(played)
+                self.ear_frames_pp[h] = pp_list[0]      # 兼容旧引用
+                self.ear_variants[h] = pp_list
             # 走路动画帧预留：命名 走路_1_306.png ~ 走路_N_306.png（透明背景）。
             # 用户后续提供走路照片后，在 _sprite_key 的 walking 分支返回
             # ("走路", cur_h, facing, False, 0)，并在 draw_one 加帧序列逻辑
@@ -807,7 +825,8 @@ class PetWindow(QWidget):
                 return
             name, h, facing, vflip, rot = key
             if name == "耳朵晃动" and h in self.ear_frames_pp:
-                seq = self.ear_frames_pp[h]
+                variants = self.ear_variants.get(h) or [self.ear_frames_pp[h]]
+                seq = variants[self.ear_variant.get(h, 0) % len(variants)]
                 pix = seq[ear_cursor(self.ear_step, len(seq))]
             else:
                 pix = self.sprites[(name, h)]
@@ -837,7 +856,10 @@ class PetWindow(QWidget):
             p.restore()
 
         cur_key = self._sprite_key()
-        if self.cross_t > 0:
+        # 交叉淡化被禁用：新旧两张图都带耳朵，而耳朵位置随姿态/朝向变化，
+        # 半透明叠加会同时显示两套耳朵（用户报告的"重耳"）。改为硬切。
+        # 需要恢复渐变观感时，把 CROSSFADE_ENABLED 置 True 即可（但会重现重耳）。
+        if CROSSFADE_ENABLED and self.cross_t > 0:
             draw_one(self.prev_key, self.cross_t)
             draw_one(cur_key, 1.0 - self.cross_t)
         else:
@@ -994,6 +1016,10 @@ class PetWindow(QWidget):
             if self.action_t == 0:
                 self.action = None
                 self.ear_step = 0
+                # 每次触发随机换一套耳朵素材（A/B），避免观感重复
+                for _h, _vs in self.ear_variants.items():
+                    if len(_vs) > 1:
+                        self.ear_variant[_h] = random.randrange(len(_vs))
                 if self.base_win_w:  # 动作图加宽的窗口恢复默认宽度
                     self.setFixedSize(self.base_win_w, self.height())
                     self.base_win_w = 0
