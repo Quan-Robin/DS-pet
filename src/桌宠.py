@@ -1340,14 +1340,36 @@ class PetWindow(QWidget):
                 self._queue_say("审批没发出去，检查 DSH 是否在跑")
         threading.Thread(target=worker, daemon=True).start()
 
+    def _set_topmost(self, on):
+        """临时开关置顶。
+
+        为什么需要：桌宠与其审批弹窗都带 WindowStaysOnTopHint，会压在 DSH 自己的
+        审批窗口之上，导致用户"点不到审批按钮"。审批出现时取消置顶，处理完再恢复。
+        """
+        try:
+            flags = self.windowFlags()
+            if on:
+                flags |= Qt.WindowType.WindowStaysOnTopHint
+            else:
+                flags &= ~Qt.WindowType.WindowStaysOnTopHint
+            if flags != self.windowFlags():
+                self.setWindowFlags(flags)
+                self.show()          # 改过 flags 必须重新 show 才会生效
+                if on:
+                    self.raise_()
+        except Exception:
+            pass
+
     def _show_approval(self, ap):
         """主线程：鱼提醒 + 审批小弹窗（批准 / 拒绝 / 看详情）。"""
         summary = (ap.get("summary") or "").strip()[:120]
         self.say("DSH 在等审批！要帮它点吗？")
+        # 让出置顶：DSH 的审批窗口需要可点（原先桌宠会挡住它的按钮）
+        self._set_topmost(False)
         dlg = QDialog(self)
         dlg.setWindowTitle("DSH 审批")
-        dlg.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
-                           | Qt.WindowType.WindowStaysOnTopHint)
+        # 不置顶：DSH 审批窗口需要能盖在它上面并被点击
+        dlg.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool)
         lay = QVBoxLayout(dlg)
         lay.setContentsMargins(14, 12, 14, 12)
         tip = QLabel("⚠️ DSH 等待审批（仅摘要，高危操作建议看详情）")
@@ -1392,6 +1414,7 @@ class PetWindow(QWidget):
 
     def _close_approval(self):
         """主线程：审批已被处理（网页/桌面端/宠物任一处），收掉弹窗。"""
+        self._set_topmost(True)   # 审批结束，恢复置顶
         if self._approval_dlg is not None:
             try:
                 self._approval_dlg.close()
