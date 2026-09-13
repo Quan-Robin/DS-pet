@@ -88,18 +88,26 @@ class DshMonitor:
         except Exception:
             return self.state or "idle"
 
-        working = False
+        # 状态是"闩锁"式的：user/message 进入 working，turn/end 回到 idle。
+        # 早期实现每轮把 working 重置为 False，且只在"本轮读到新的 user/message"
+        # 时才置 True —— 用户消息之后的第一轮就误判为空闲，于是整个工作期间
+        # 桌宠一直显示"DSH 空闲"（已用真实会话复现：连续 6 次轮询全为 idle）。
+        changed = False
         for ev in events:
             t = ev.get("type")
             seq = ev.get("seq") or 0
             if t == "user/message":
                 if seq > self.last_user_seq:
                     self.last_user_seq = seq
-                    working = True
+                    if self.state != "working":
+                        self.state = "working"
+                        changed = True
             elif t == "turn/end":
                 if seq > self.last_seq:
                     self.last_seq = seq
-                    working = False
+                    if self.state != "idle":
+                        self.state = "idle"
+                        changed = True
                     if self.baseline and self.on_turn_end is not None:
                         self.on_turn_end(self.last_summary)
             elif t == "assistant/message":
@@ -109,30 +117,38 @@ class DshMonitor:
                 if text:
                     self.last_summary = text
 
-        new_state = "working" if working else "idle"
         if not self.baseline:
             self.baseline = True
-            self.state = new_state
-        elif new_state != self.state:
-            self.state = new_state
-            if self.on_change is not None:
-                self.on_change(new_state)
-        return new_state
+            self.state = self.state or "idle"
+        elif changed and self.on_change is not None:
+            self.on_change(self.state)
+        return self.state or "idle"
+
+    # dsh 0.1.5+ 的会话文件是 session.v3.jsonl.zstd；早期版本用 session.jsonl.zstd。
+    # 只 glob 旧名字会读到过期的空文件（本机实测：读到 8 月的 legacy 文件、只有 1 个
+    # session 事件）→ 状态永远判定为 idle，桌宠一直显示"DSH 空闲"。
+    _SESSION_NAMES = ("session.v3.jsonl.zstd", "session.jsonl.zstd")
 
     def _latest_session(self):
-        """最新（mtime 最大）的会话文件；返回 (路径, mtime) 或 (None, 0)。"""
-        best = None
-        try:
-            for f in glob.glob(os.path.join(DSH_SESSIONS, "*", "*", "session.jsonl.zstd")):
-                try:
-                    m = os.path.getmtime(f)
-                except OSError:
-                    continue
-                if os.path.getsize(f) > 100 and (best is None or m > best[1]):
-                    best = (f, m)
-        except Exception:
-            pass
-        return best if best else (None, 0)
+        """最新（mtime 最大）的会话文件；返回 (路径, mtime) 或 (None, 0)。
+
+        优先新格式：只要存在 v3 文件就只在 v3 里挑最新的；都没有才回退旧格式。
+        """
+        for name in self._SESSION_NAMES:
+            best = None
+            try:
+                for f in glob.glob(os.path.join(DSH_SESSIONS, "*", "*", name)):
+                    try:
+                        m = os.path.getmtime(f)
+                    except OSError:
+                        continue
+                    if os.path.getsize(f) > 100 and (best is None or m > best[1]):
+                        best = (f, m)
+            except Exception:
+                best = None
+            if best:
+                return best
+        return (None, 0)
 
     def _read_events(self, path, mtime=None):
         """解压并解析会话文件，返回事件列表；(mtime, size) 未变时直接用缓存。"""
@@ -143,8 +159,18 @@ class DshMonitor:
             c = self._cache.get(path)
             if c and c[0] == st.st_mtime and c[1] == st.st_size:
                 return c[2]
-        raw = open(path, "rb").read()
-        buf = zstandard.ZstdDecompressor().decompress(raw, max_output_size=MAX_DECOMPRESS)
+        # 必须用"流式跨帧"解压：dsh 的会话文件是多帧追加写入的（本机实测 4.3MB
+        # / 4932 行），而一次性 decompress() 只解出第一帧 —— 于是只拿到首行
+        # `session` 事件，user/message 与 turn/end 全部看不到，状态永远判为 idle
+        # （这正是桌宠一直显示"DSH 空闲"的根因）。
+        dctx = zstandard.ZstdDecompressor()
+        with open(path, "rb") as fh:
+            try:
+                reader = dctx.stream_reader(fh, read_across_frames=True)
+            except TypeError:      # 老版本 python-zstandard 无此参数
+                reader = dctx.stream_reader(fh)
+            with reader:
+                buf = reader.read(MAX_DECOMPRESS)
         events = []
         for line in buf.decode("utf-8", "replace").split("\n"):
             if '"type"' not in line:
