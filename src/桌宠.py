@@ -1251,7 +1251,38 @@ class PetWindow(QWidget):
 
     # ---------- DSH 审批提醒（联动 DSH-desktop 伴生插件） ----------
 
+    def _probe_dsh_port(self):
+        """探测正在运行的 dsh 端口。
+
+        为什么需要：配置里的 dsh_port 默认 3080，而 dsh 的实际端口可能被改成别的
+        （例如 3082），端口不对时轮询全部失败且被静默吞掉 —— 表现为"DSH 协作功能
+        完全失效"。伴生插件的 /api/state 会回带 plugin 标识，用它确认是本尊。
+        连接被拒会立刻失败（ECONNREFUSED），所以扫描实际很快。
+        """
+        cands = []
+        try:
+            cands.append(int(self.cfg.get("dsh_port", 3080)))
+        except (TypeError, ValueError):
+            cands.append(3080)
+        cands += [p for p in range(3080, 3093) if p not in cands]
+        for port in cands:
+            try:
+                r = requests.get(f"http://127.0.0.1:{port}/api/state", timeout=0.35)
+                if r.status_code == 200 and isinstance(r.json(), dict) and r.json().get("plugin"):
+                    return port
+            except Exception:
+                continue
+        return None
+
     def _approval_port(self):
+        """当前可用的 DSH 端口：优先用已验证过的，其次探测，最后退回配置值。"""
+        cached = getattr(self, "_dsh_port_ok", None)
+        if cached:
+            return cached
+        found = self._probe_dsh_port()
+        if found:
+            self._dsh_port_ok = found
+            return found
         try:
             return int(self.cfg.get("dsh_port", 3080))
         except (TypeError, ValueError):
@@ -1278,6 +1309,7 @@ class PetWindow(QWidget):
                     f"http://127.0.0.1:{self._approval_port()}/api/state",
                     timeout=2)
                 if r.status_code != 200:
+                    self._dsh_port_ok = None   # 端口可能变了 → 下轮重新探测
                     continue
                 ap = (r.json() or {}).get("pendingApproval")
                 if ap and ap.get("id") and ap.get("id") != self._approval_seen_id:
@@ -1287,7 +1319,8 @@ class PetWindow(QWidget):
                     self._approval_seen_id = None
                     self._say_queue.append(("approval-clear",))
             except Exception:
-                pass  # 插件未装 / DSH 未跑：静默
+                self._dsh_port_ok = None       # 连不上 → 下轮重新探测
+                # 插件未装 / DSH 未跑：静默
 
     def _send_approval(self, decision):
         """后台线程：POST 批准/拒绝到伴生插件。"""
